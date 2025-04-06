@@ -1,7 +1,3 @@
-Below is an updated README that’s tailored for running a Cronos RPC node (non-validator) without any key generation or consensus operations instructions:
-
----
-
 # Cronos Node Docker
 
 This repository provides Docker Compose configurations for running a Cronos RPC node.
