@@ -1,59 +1,73 @@
-# cronos-node-docker
+Below is an updated README that’s tailored for running a Cronos RPC node (non-validator) without any key generation or consensus operations instructions:
 
-Docker compose for Cronos Node.
+---
 
-Meant to be used with [central-proxy-docker](https://github.com/CryptoManufaktur-io/central-proxy-docker) for traefik
-and Prometheus remote write; use `:ext-network.yml` in `COMPOSE_FILE` inside `.env` in that case.
+# Cronos Node Docker
 
-## Quick setup
+This repository provides Docker Compose configurations for running a Cronos RPC node.
 
-Run `cp default.env .env`, then `nano .env`, and update values like MONIKER, NETWORK, and SNAPSHOT.
+It’s designed to work with [central-proxy-docker](https://github.com/CryptoManufaktur-io/central-proxy-docker) for Traefik and Prometheus remote write. If you need external network connectivity, include `:ext-network.yml` in your `COMPOSE_FILE` (as set in your `.env` file).
 
-If you want the consensus node RPC ports exposed locally, use `rpc-shared.yml` in `COMPOSE_FILE` inside `.env`.
+## Quick Setup
 
-- `./cronosd install` brings in docker-ce, if you don't have Docker installed already.
-- `docker compose run --rm create-validator-keys` creates the consensus/validator node keys
-- `docker compose run --rm create-operator-wallet` creates the operator wallet used to register the validator
-- `docker compose run --rm create-bls-key` creates the BLS key using the priv_validator_key.json and the operator wallet.
-- `docker compose run --rm import-validator-keys` imports the generated consensus/validator + bls keys into the docker volume
-- `./cronosd up`
+1. **Prepare your environment:**  
+   Copy the default environment file and update your settings:
+   ```bash
+   cp default.env .env
+   nano .env
+   ```
+   Update values such as `MONIKER`, `NETWORK`, and `SNAPSHOT`.
 
-To update the software, run `./cronosd update` and then `./cronosd up`
+2. **Expose RPC Ports (Optional):**  
+   If you want the node’s RPC ports exposed locally, include `rpc-shared.yml` in your `COMPOSE_FILE` within `.env`.
 
-## consensus
+3. **Install Docker (if needed):**  
+   Run:
+   ```bash
+   ./cronosd install
+   ```
+   This command installs Docker CE if it isn’t already installed.
 
-### Validator Key Generation
+4. **Start the Node:**  
+   Bring up your Cronos RPC node by running:
+   ```bash
+   ./cronosd up
+   ```
 
-Run `docker compose run --rm create-validator-keys`
+5. **Software Updates:**  
+   To update the node software, run:
+   ```bash
+   ./cronosd update
+   ./cronosd up
+   ```
 
-It is meant to be executed only once, it has no sanity checks and creates the `priv_validator_key.json` and `priv_validator_state.json` files inside the `keys/consensus/` folder.
+## Snapshot and Genesis Setup
 
-Remember to backup those files if you're running a validator.
+When you first start the node, the container will:
 
-You can also export the keys from the docker volume, into the `keys/consensus/` folder by running: `docker compose run --rm export-validator-keys`.
+- **Initialize the node:**  
+  Run `cronosd init` with your specified `MONIKER` and `NETWORK`.
+- **Download the genesis file:**  
+  It retrieves the genesis file from the official Cronos mainnet repository.
+- **Download seeds:**  
+  The configuration is updated with a list of seed nodes.
+- **Download and extract a snapshot (if provided):**  
+  If the `SNAPSHOT` environment variable is set, the snapshot will be downloaded via `aria2c` and then extracted into the node’s data directory using a pipeline that displays progress.
 
-### Operator Wallet Creation
+## CLI Usage
 
-An operator wallet is needed for staking operations. We provide a simple command to generate it, so it can be done in an air-gapped environment. It is meant to be executed only once, it has no sanity checks. It creates the operator wallet and stores the result in the `keys/operator/` folder.
+A CLI image containing the `cronosd` binary is also available. For example:
+- To display node status:
+  ```bash
+  docker compose run --rm cli tendermint show-node-id
+  ```
+- To query account balances:
+  ```bash
+  docker compose run --rm cli query bank balances <your_address> --node http://cronos:26657/
+  ```
 
-Make sure to backup the `keys/operator/$MONIKER.backup` file, it is the only way to recover the wallet.
-
-Run `docker compose run --rm create-operator-wallet`
-
-### Register Validator
-
-This assumes an operator wallet `keys/operator/$MONIKER.info` is present, and the `priv_validator_key.json` is present in the `keys/consensus/` folder.
-
-`docker compose run --rm register-validator`
-
-### CLI
-
-An image with the `cronosd` binary is also avilable, e.g:
-
-- `docker compose run --rm cli tendermint show-validator`
-- `docker compose run --rm cli query bank balances bbn1q5u89k4w0tj7nxvmp6dhz3yaflw2cx9epv3g5x --node http://cronos:26657/`
 ## Version
 
-Cronos Node Docker uses a semver scheme.
-
+Cronos Node Docker uses semantic versioning.  
 This is cronos-node-docker v1.0.0
+
