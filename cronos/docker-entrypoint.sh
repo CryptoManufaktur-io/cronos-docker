@@ -86,6 +86,10 @@ dasel put -f /cosmos/config/app.toml -v "$MIN_GAS_PRICE" "minimum-gas-prices"
 dasel put -f /cosmos/config/app.toml -v 0 "iavl-cache-size"
 dasel put -f /cosmos/config/app.toml -v "true" "iavl-disable-fastnode"
 dasel put -f /cosmos/config/app.toml -v "signet" "btc-config.network"
+dasel put -f /cosmos/config/app.toml -v 0  'mempool."max-txs"'
+dasel put -f /cosmos/config/app.toml -v 10 'mempool.feebump'
+dasel put -f /cosmos/config/app.toml -v false 'cronos.disable-tx-replacement'
+dasel put -f /cosmos/config/app.toml -v true  'cronos.disable-optimistic-execution'
 dasel put -f /cosmos/config/client.toml -v "tcp://localhost:${CL_RPC_PORT}" node
 
 # Word splitting is desired for the command line parameters.
