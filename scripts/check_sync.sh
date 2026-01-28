@@ -7,7 +7,7 @@ __compose_service_set=0
 __container=""
 __local_rpc=""
 __public_rpc="https://evm.cronos.org"
-__block_lag=20
+__block_lag=2
 __env_file=""
 __no_install=0
 
