@@ -62,6 +62,20 @@ A CLI image containing the `cronosd` binary is also available. For example:
   docker compose run --rm cli query bank balances <your_address> --node http://cronos:26657/
   ```
 
+## Sync Check
+
+To compare your local node against a public Cronos RPC endpoint, run:
+```bash
+./cronosd check-sync
+```
+Defaults: compose service `cronos`, local RPC `http://127.0.0.1:${RPC_PORT:-8545}`, public RPC `https://evm.cronos.org`.
+Override them with `--compose-service`, `--local-rpc`, and `--public-rpc` flags as needed.
+For full usage, run:
+```bash
+./cronosd check-sync --help
+```
+Common flags: `--container`, `--block-lag`, `--env-file`, `--no-install`.
+
 ## Version
 
 Cronos Node Docker uses semantic versioning.
