@@ -29,8 +29,8 @@ __load_env_file() {
     if [[ "${__line}" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
       local __key="${BASH_REMATCH[1]}"
       local __value="${BASH_REMATCH[2]}"
-      __value="${__value#${__value%%[![:space:]]*}}"
-      __value="${__value%${__value##*[![:space:]]}}"
+      __value="${__value#"${__value%%[![:space:]]*}"}"
+      __value="${__value%"${__value##*[![:space:]]}"}"
       if [[ "${__value}" =~ ^\".*\"$ ]]; then
         __value="${__value:1:-1}"
       elif [[ "${__value}" =~ ^\'.*\'$ ]]; then
@@ -146,9 +146,9 @@ __rpc_jq() {
   local __filter="$3"
   local __jq_opts="$4"
   if [ "${__use_container}" -eq 1 ]; then
-    __in_container_exec "curl -sS --fail -H 'Content-Type: application/json' --data '${__payload}' '${__rpc}' | jq ${__jq_opts} '${__filter}'"
+    __in_container_exec "curl -sS --fail -H 'Content-Type: application/json' --data '${__payload}' '${__rpc}' | jq \"${__jq_opts}\" '${__filter}'"
   else
-    curl -sS --fail -H 'Content-Type: application/json' --data "${__payload}" "${__rpc}" | jq ${__jq_opts} "${__filter}"
+    curl -sS --fail -H 'Content-Type: application/json' --data "${__payload}" "${__rpc}" | jq "${__jq_opts}" "${__filter}"
   fi
 }
 
