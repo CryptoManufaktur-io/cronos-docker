@@ -14,7 +14,7 @@ services:
       args:
         - DAEMON_VERSION=${CRONOS_NODE_VERSION}
         - USER=cronos
-    image: cronos:local
+    image: cronos:${CRONOS_NODE_VERSION}
     pull_policy: never
     user: cronos
     restart: unless-stopped

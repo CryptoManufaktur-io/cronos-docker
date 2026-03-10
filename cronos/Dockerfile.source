@@ -2,7 +2,7 @@
 FROM ghcr.io/tomwright/dasel:2-alpine AS dasel
 
 # Build cronosd
-FROM golang:1.23-bookworm AS builder
+FROM golang:1.25-bookworm AS builder
 
 ARG DAEMON_VERSION=v0.9.0
 # Toggle insecure mode for local testing (set to "true" for local testing)
