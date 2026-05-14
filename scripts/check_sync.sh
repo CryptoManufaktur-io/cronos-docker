@@ -1,397 +1,306 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
-
-__me="$(basename "$0")"
-__compose_service=""
-__compose_service_set=0
-__container=""
-__local_rpc=""
-__public_rpc="https://evm.cronos.org"
-__block_lag=2
-__env_file=""
-__no_install=0
+set -euo pipefail
 
 usage() {
-  echo "usage: ${__me} [--compose-service name] [--container name] [--local-rpc url] [--public-rpc url]"
-  echo "             [--block-lag n] [--env-file path] [--no-install]"
-  echo
-  echo "Defaults:"
-  echo "  local RPC:  http://127.0.0.1:\${RPC_PORT:-8545}"
-  echo "  public RPC: ${__public_rpc}"
-  echo "  block lag:  ${__block_lag}"
+  cat <<'EOF'
+Usage: check_sync.sh [options]
+
+Options:
+  --container NAME         Docker container name or ID to run curl/jq within
+  --compose-service NAME   Docker Compose service name to resolve to a container
+  --local-rpc URL          Local RPC URL (default: http://127.0.0.1:${RPC_PORT:-8545})
+  --public-rpc URL         Public/reference RPC URL (required)
+  --block-lag N            Acceptable lag in blocks (default: 2)
+  --sample-secs N          ETA sampling window in seconds (default: 10)
+  --no-install             Do not install curl/jq inside the container
+  --env-file PATH          Path to env file to load
+  -h, --help               Show this help
+
+Examples:
+  ./check_sync.sh --public-rpc https://1rpc.io/cro
+  ./check_sync.sh --compose-service cronos --public-rpc https://1rpc.io/cro
+  CONTAINER=cronos-1 PUBLIC_RPC=https://1rpc.io/cro ./check_sync.sh
+EOF
 }
 
-__load_env_file() {
-  local __file="$1"
-  [ -f "${__file}" ] || return 0
-  while IFS= read -r __line || [ -n "${__line}" ]; do
-    [[ -z "${__line}" || "${__line}" =~ ^[[:space:]]*# ]] && continue
-    if [[ "${__line}" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
-      local __key="${BASH_REMATCH[1]}"
-      local __value="${BASH_REMATCH[2]}"
-      __value="${__value#"${__value%%[![:space:]]*}"}"
-      __value="${__value%"${__value##*[![:space:]]}"}"
-      if [[ "${__value}" =~ ^\".*\"$ ]]; then
-        __value="${__value:1:-1}"
-      elif [[ "${__value}" =~ ^\'.*\'$ ]]; then
-        __value="${__value:1:-1}"
+ENV_FILE="${ENV_FILE:-}"
+CONTAINER="${CONTAINER:-}"
+DOCKER_SERVICE="${DOCKER_SERVICE:-}"
+LOCAL_RPC="${LOCAL_RPC:-}"
+PUBLIC_RPC="${PUBLIC_RPC:-}"
+BLOCK_LAG_THRESHOLD="${BLOCK_LAG_THRESHOLD:-2}"
+SAMPLE_SECS="${SAMPLE_SECS:-10}"
+INSTALL_TOOLS="${INSTALL_TOOLS:-1}"
+
+load_env_file() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    line="${line#export }"
+    if [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+      local key="${line%%=*}"
+      local val="${line#*=}"
+      val="${val#"${val%%[![:space:]]*}"}"
+      if [[ "$val" =~ ^\".*\"$ ]]; then
+        val="${val:1:-1}"
+      elif [[ "$val" =~ ^\'.*\'$ ]]; then
+        val="${val:1:-1}"
       fi
-      export "${__key}=${__value}"
+      printf -v "$key" '%s' "$val"
+      export "${key?}"
     fi
-  done < "${__file}"
+  done < "$file"
 }
 
-__need_cmd() {
-  if ! command -v "$1" >/dev/null 2>&1; then
-    echo "❌ Missing required command: $1"
-    exit 2
+args=("$@")
+for ((i=0; i<${#args[@]}; i++)); do
+  if [[ "${args[$i]}" == "--env-file" ]]; then
+    ENV_FILE="${args[$((i+1))]:-}"
   fi
-}
+done
 
-__hex_to_dec() {
-  local __hex="$1"
-  if [ -z "${__hex}" ] || [ "${__hex}" = "null" ]; then
-    echo ""
-    return
-  fi
-  printf '%d' "$((16#${__hex#0x}))"
-}
-
-__dec_to_hex() {
-  printf '0x%x' "$1"
-}
-
-__format_duration() {
-  local __seconds="$1"
-  if [ -z "${__seconds}" ] || [ "${__seconds}" -le 0 ]; then
-    echo "n/a"
-    return
-  fi
-  local __h=$((__seconds / 3600))
-  local __m=$(((__seconds % 3600) / 60))
-  local __s=$((__seconds % 60))
-  if [ "${__h}" -gt 0 ]; then
-    printf '%dh%dm%ds' "${__h}" "${__m}" "${__s}"
-  elif [ "${__m}" -gt 0 ]; then
-    printf '%dm%ds' "${__m}" "${__s}"
-  else
-    printf '%ds' "${__s}"
-  fi
-}
-
-__compose_cmd=("docker" "compose")
-
-__compose_exec() {
-  "${__compose_cmd[@]}" exec -T "${__compose_service}" sh -lc "$1"
-}
-
-__compose_exec_root() {
-  "${__compose_cmd[@]}" exec -T --user root "${__compose_service}" sh -lc "$1"
-}
-
-__container_exec() {
-  docker exec -i "${__container}" sh -lc "$1"
-}
-
-__container_exec_root() {
-  docker exec -i --user root "${__container}" sh -lc "$1"
-}
-
-__in_container_exec() {
-  if [ -n "${__container}" ]; then
-    __container_exec "$1"
-  else
-    __compose_exec "$1"
-  fi
-}
-
-__in_container_exec_root() {
-  if [ -n "${__container}" ]; then
-    __container_exec_root "$1"
-  else
-    __compose_exec_root "$1"
-  fi
-}
-
-__ensure_container_tools() {
-  if [ "${__no_install}" -eq 1 ]; then
-    echo "⚠️  Skipping tool installation checks (--no-install)."
-    return
-  fi
-  echo "⏳ Checking tools inside container"
-  if __in_container_exec "command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1"; then
-    echo "✅ Tools available in container"
-    return
-  fi
-  echo "⚠️  curl/jq missing in container; attempting install"
-  if __in_container_exec_root "command -v apt-get >/dev/null 2>&1"; then
-    __in_container_exec_root "apt-get update -y >/dev/null 2>&1 && apt-get install -y curl jq >/dev/null 2>&1"
-  elif __in_container_exec_root "command -v apk >/dev/null 2>&1"; then
-    __in_container_exec_root "apk add --no-cache curl jq >/dev/null 2>&1"
-  else
-    echo "❌ Could not install curl/jq (no apt-get or apk)"
-    exit 2
-  fi
-  if __in_container_exec "command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1"; then
-    echo "✅ Installed curl/jq in container"
-  else
-    echo "❌ curl/jq still missing after install attempt"
-    exit 2
-  fi
-}
-
-__rpc_jq() {
-  local __rpc="$1"
-  local __payload="$2"
-  local __filter="$3"
-  local __jq_opts="$4"
-  if [ "${__use_container}" -eq 1 ]; then
-    __in_container_exec "curl -sS --fail -H 'Content-Type: application/json' --data '${__payload}' '${__rpc}' | jq \"${__jq_opts}\" '${__filter}'"
-  else
-    curl -sS --fail -H 'Content-Type: application/json' --data "${__payload}" "${__rpc}" | jq "${__jq_opts}" "${__filter}"
-  fi
-}
-
-__payload_head_number='{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
-__payload_syncing='{"jsonrpc":"2.0","id":1,"method":"eth_syncing","params":[]}'
-
-__payload_block_by_tag() {
-  local __tag="$1"
-  echo "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getBlockByNumber\",\"params\":[\"${__tag}\",false]}"
-}
-
-__payload_block_by_height() {
-  local __height_dec="$1"
-  local __hex
-  __hex=$(__dec_to_hex "${__height_dec}")
-  __payload_block_by_tag "${__hex}"
-}
+if [[ -n "${ENV_FILE:-}" ]]; then
+  load_env_file "$ENV_FILE"
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --compose-service)
-      __compose_service="$2"
-      __compose_service_set=1
-      shift 2
-      ;;
-    --container)
-      __container="$2"
-      shift 2
-      ;;
-    --local-rpc)
-      __local_rpc="$2"
-      shift 2
-      ;;
-    --public-rpc)
-      __public_rpc="$2"
-      shift 2
-      ;;
-    --block-lag)
-      __block_lag="$2"
-      shift 2
-      ;;
-    --env-file)
-      __env_file="$2"
-      shift 2
-      ;;
-    --no-install)
-      __no_install=1
-      shift
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      echo "❌ Unknown argument: $1"
-      usage
-      exit 2
-      ;;
+    --container) CONTAINER="$2"; shift 2 ;;
+    --compose-service) DOCKER_SERVICE="$2"; shift 2 ;;
+    --local-rpc) LOCAL_RPC="$2"; shift 2 ;;
+    --public-rpc) PUBLIC_RPC="$2"; shift 2 ;;
+    --block-lag) BLOCK_LAG_THRESHOLD="$2"; shift 2 ;;
+    --sample-secs) SAMPLE_SECS="$2"; shift 2 ;;
+    --no-install) INSTALL_TOOLS="0"; shift ;;
+    --env-file) ENV_FILE="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $1"; usage; exit 2 ;;
   esac
 done
 
-if [ -z "${__env_file}" ] && [ -f .env ]; then
-  __env_file=.env
-fi
+LOCAL_RPC="${LOCAL_RPC:-http://127.0.0.1:${RPC_PORT:-8545}}"
+PUBLIC_RPC="${PUBLIC_RPC:-}"
 
-if [ -n "${__env_file}" ]; then
-  __load_env_file "${__env_file}"
-fi
+hex_to_dec() { printf "%d" "$((16#${1#0x}))"; }
 
-__rpc_port="${RPC_PORT:-8545}"
-if [ -z "${__local_rpc}" ]; then
-  __local_rpc="http://127.0.0.1:${__rpc_port}"
-fi
-
-if [ -z "${__public_rpc}" ]; then
-  echo "❌ --public-rpc is required"
-  exit 2
-fi
-
-__use_container=0
-if [ -n "${__container}" ]; then
-  __use_container=1
-elif [ "${__compose_service_set}" -eq 1 ] && [ -n "${__compose_service}" ]; then
-  __use_container=1
-fi
-
-if [ "${__use_container}" -eq 1 ]; then
-  if [ -n "${__env_file}" ]; then
-    __compose_cmd+=("--env-file" "${__env_file}")
+resolve_container() {
+  if [[ -n "$CONTAINER" || -z "$DOCKER_SERVICE" ]]; then
+    return 0
   fi
-  __ensure_container_tools
-else
-  __need_cmd curl
-  __need_cmd jq
-fi
-
-echo "⏳ Sync status"
-if ! __syncing_raw=$(__rpc_jq "${__local_rpc}" "${__payload_syncing}" '.result' '-c'); then
-  echo "❌ Failed to query eth_syncing from local RPC"
-  exit 2
-fi
-
-__is_syncing=0
-if [ "${__syncing_raw}" = "false" ]; then
-  echo "✅ eth_syncing: false"
-elif [ "${__syncing_raw}" = "null" ] || [ -z "${__syncing_raw}" ]; then
-  echo "⚠️  eth_syncing: unavailable"
-else
-  __is_syncing=1
-  echo "⏳ eth_syncing: true"
-  if ! __sync_start_hex=$(__rpc_jq "${__local_rpc}" "${__payload_syncing}" '.result.startingBlock' '-r'); then
-    __sync_start_hex=""
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "❌ docker not found; cannot resolve --compose-service $DOCKER_SERVICE"
+    exit 2
   fi
-  if ! __sync_current_hex=$(__rpc_jq "${__local_rpc}" "${__payload_syncing}" '.result.currentBlock' '-r'); then
-    __sync_current_hex=""
-  fi
-  if ! __sync_highest_hex=$(__rpc_jq "${__local_rpc}" "${__payload_syncing}" '.result.highestBlock' '-r'); then
-    __sync_highest_hex=""
-  fi
-  __sync_start_dec=$(__hex_to_dec "${__sync_start_hex}")
-  __sync_current_dec=$(__hex_to_dec "${__sync_current_hex}")
-  __sync_highest_dec=$(__hex_to_dec "${__sync_highest_hex}")
-  [ -n "${__sync_start_dec}" ] && echo "  startingBlock: ${__sync_start_dec}"
-  [ -n "${__sync_current_dec}" ] && echo "  currentBlock:  ${__sync_current_dec}"
-  [ -n "${__sync_highest_dec}" ] && echo "  highestBlock:  ${__sync_highest_dec}"
-fi
-
-echo
-echo "⏳ Head comparison"
-if ! __local_hex=$(__rpc_jq "${__local_rpc}" "${__payload_head_number}" '.result' '-r'); then
-  echo "❌ Failed to query local block height"
-  exit 2
-fi
-if ! __public_hex=$(__rpc_jq "${__public_rpc}" "${__payload_head_number}" '.result' '-r'); then
-  echo "❌ Failed to query public block height"
-  exit 2
-fi
-
-__local_height=$(__hex_to_dec "${__local_hex}")
-__public_height=$(__hex_to_dec "${__public_hex}")
-
-if [ -z "${__local_height}" ] || [ -z "${__public_height}" ]; then
-  echo "❌ Missing local/public block height"
-  exit 2
-fi
-
-__lag=$((__public_height - __local_height))
-__lag_note=""
-if [ "${__lag}" -lt 0 ]; then
-  __lag_note=" (local ahead)"
-  __lag=0
-fi
-
-__eta="n/a"
-if [ "${__public_height}" -ge 100 ] && [ "${__lag}" -gt 0 ]; then
-  __sample_old=$((__public_height - 100))
-  if __ts_head_hex=$(__rpc_jq "${__public_rpc}" "$(__payload_block_by_height "${__public_height}")" '.result.timestamp' '-r'); then
-    if __ts_old_hex=$(__rpc_jq "${__public_rpc}" "$(__payload_block_by_height "${__sample_old}")" '.result.timestamp' '-r'); then
-      __ts_head_dec=$(__hex_to_dec "${__ts_head_hex}")
-      __ts_old_dec=$(__hex_to_dec "${__ts_old_hex}")
-      if [ -n "${__ts_head_dec}" ] && [ -n "${__ts_old_dec}" ] && [ "${__ts_head_dec}" -gt "${__ts_old_dec}" ]; then
-        __delta=$((__ts_head_dec - __ts_old_dec))
-        __avg=$((__delta / 100))
-        if [ "${__avg}" -gt 0 ]; then
-          __eta=$(__format_duration $((__lag * __avg)))
-        fi
-      fi
-    fi
-  fi
-fi
-
-if ! __local_latest_num_hex=$(__rpc_jq "${__local_rpc}" "$(__payload_block_by_tag latest)" '.result.number' '-r'); then
-  __local_latest_num_hex=""
-fi
-if ! __local_latest_hash=$(__rpc_jq "${__local_rpc}" "$(__payload_block_by_tag latest)" '.result.hash' '-r'); then
-  __local_latest_hash=""
-fi
-if ! __public_latest_num_hex=$(__rpc_jq "${__public_rpc}" "$(__payload_block_by_tag latest)" '.result.number' '-r'); then
-  __public_latest_num_hex=""
-fi
-if ! __public_latest_hash=$(__rpc_jq "${__public_rpc}" "$(__payload_block_by_tag latest)" '.result.hash' '-r'); then
-  __public_latest_hash=""
-fi
-
-__local_latest_num=$(__hex_to_dec "${__local_latest_num_hex}")
-__public_latest_num=$(__hex_to_dec "${__public_latest_num_hex}")
-
-__diverged=0
-__compare_height=""
-if [ -n "${__local_height}" ] && [ -n "${__public_height}" ]; then
-  if [ "${__local_height}" -le "${__public_height}" ]; then
-    __compare_height="${__local_height}"
+  if docker compose version >/dev/null 2>&1; then
+    CONTAINER="$(docker compose ps -q "$DOCKER_SERVICE" | head -n 1)"
+  elif command -v docker-compose >/dev/null 2>&1; then
+    CONTAINER="$(docker-compose ps -q "$DOCKER_SERVICE" | head -n 1)"
   else
-    __compare_height="${__public_height}"
+    echo "❌ docker compose not available; cannot resolve --compose-service $DOCKER_SERVICE"
+    exit 2
   fi
+}
+
+rpc_post() {
+  # args: rpc_url, json_payload
+  local rpc="$1"
+  local payload="$2"
+  if [[ -n "$CONTAINER" ]]; then
+    docker exec "$CONTAINER" sh -c "
+      curl -sS -X POST '$rpc' \
+        -H 'Content-Type: application/json' \
+        --data '$payload'
+    "
+  else
+    curl -sS -X POST "$rpc" \
+      -H 'Content-Type: application/json' \
+      --data "$payload"
+  fi
+}
+
+jq_eval() {
+  if [[ -n "$CONTAINER" ]]; then
+    docker exec -i "$CONTAINER" jq -r "$1"
+  else
+    jq -r "$1"
+  fi
+}
+
+resolve_container
+
+if [[ -z "$PUBLIC_RPC" ]]; then
+  echo "❌ PUBLIC_RPC is required. Use --public-rpc or set PUBLIC_RPC."
+  exit 2
 fi
 
-if [ -n "${__compare_height}" ] && [ "${__compare_height}" -gt 0 ]; then
-  if __local_common_hash=$(__rpc_jq "${__local_rpc}" "$(__payload_block_by_height "${__compare_height}")" '.result.hash' '-r'); then
-    if __public_common_hash=$(__rpc_jq "${__public_rpc}" "$(__payload_block_by_height "${__compare_height}")" '.result.hash' '-r'); then
-      if [ -n "${__local_common_hash}" ] && [ -n "${__public_common_hash}" ] && [ "${__local_common_hash}" != "${__public_common_hash}" ]; then
-        __diverged=1
-        __divergence_note="Hash mismatch at height ${__compare_height}"
-      fi
+if [[ -n "$CONTAINER" ]]; then
+  if [[ "$INSTALL_TOOLS" == "1" ]]; then
+    echo "==> Ensuring curl and jq are installed inside container"
+
+    docker exec -u root "$CONTAINER" sh -c '
+    set -e
+    if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+      exit 0
     fi
+
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update -y
+      apt-get install -y curl jq ca-certificates
+    elif command -v apk >/dev/null 2>&1; then
+      apk add --no-cache curl jq ca-certificates
+    else
+      echo "Unsupported base image. No apt-get or apk found."
+      exit 1
+    fi
+    '
+  fi
+else
+  if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+    echo "❌ curl and jq are required on the host when no --container is set."
+    exit 2
   fi
 fi
 
-if [ -n "${__divergence_note:-}" ]; then
-  echo "❌ ${__divergence_note}"
+echo "==> Checking local geth eth_syncing status"
+
+syncing_json="$(rpc_post "$LOCAL_RPC" '{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}')"
+syncing_result="$(echo "$syncing_json" | jq_eval '.result | @json')"
+
+# syncing_result here is a JSON-encoded string of result. Handle "false" and objects.
+# If result is false, @json produces "false" (a JSON string containing false). For objects, it produces a JSON string.
+if [[ -z "$syncing_result" || "$syncing_result" == "null" ]]; then
+  echo "❌ Could not parse eth_syncing response. Raw response:"
+  echo "$syncing_json"
+  exit 5
 fi
 
-echo "Local head:  ${__local_height}"
-echo "Public head: ${__public_height}"
-echo "Lag:         ${__lag} blocks (threshold: ${__block_lag})${__lag_note}"
-echo "ETA sample:  ${__eta}"
+# Strip surrounding quotes if present (jq @json returns a JSON string)
+syncing_unquoted="$(printf '%s' "$syncing_result" | sed -e 's/^"//' -e 's/"$//')"
+
+if [[ "$syncing_unquoted" == "false" ]]; then
+  echo "eth_syncing: false (not actively syncing)"
+else
+  echo "eth_syncing: true (actively syncing)"
+  # Try to print common geth fields if present
+  startingBlock="$(printf '%s' "$syncing_unquoted" | jq_eval '.startingBlock // empty' 2>/dev/null || true)"
+  currentBlock="$(printf '%s' "$syncing_unquoted"  | jq_eval '.currentBlock  // empty' 2>/dev/null || true)"
+  highestBlock="$(printf '%s' "$syncing_unquoted"  | jq_eval '.highestBlock  // empty' 2>/dev/null || true)"
+
+  if [[ -n "${startingBlock:-}" || -n "${currentBlock:-}" || -n "${highestBlock:-}" ]]; then
+    if [[ "${startingBlock:-}" == 0x* ]]; then startingBlock="$(hex_to_dec "$startingBlock")"; fi
+    if [[ "${currentBlock:-}"  == 0x* ]]; then currentBlock="$(hex_to_dec "$currentBlock")"; fi
+    if [[ "${highestBlock:-}"  == 0x* ]]; then highestBlock="$(hex_to_dec "$highestBlock")"; fi
+    echo "  startingBlock: ${startingBlock:-?}"
+    echo "  currentBlock:  ${currentBlock:-?}"
+    echo "  highestBlock:  ${highestBlock:-?}"
+  else
+    echo "  (sync details not provided in this client response)"
+  fi
+fi
 
 echo
-echo "⏳ Latest block comparison"
-if [ -n "${__local_latest_num}" ]; then
-  echo "Local latest:  ${__local_latest_num} ${__local_latest_hash}"
-else
-  echo "Local latest:  unavailable"
+echo "==> Querying local and public heads (eth_blockNumber) and estimating ETA"
+
+local_bn_json="$(rpc_post "$LOCAL_RPC" '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}')"
+public_bn_json="$(rpc_post "$PUBLIC_RPC" '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}')"
+
+local_bn_hex="$(echo "$local_bn_json"  | jq_eval '.result')"
+public_bn_hex="$(echo "$public_bn_json" | jq_eval '.result')"
+
+if [[ "$local_bn_hex" == "null" || -z "$local_bn_hex" ]]; then
+  echo "❌ Local eth_blockNumber invalid. Raw response:"
+  echo "$local_bn_json"
+  exit 6
 fi
 
-if [ -n "${__public_latest_num}" ]; then
-  echo "Public latest: ${__public_latest_num} ${__public_latest_hash}"
-else
-  echo "Public latest: unavailable"
+if [[ "$public_bn_hex" == "null" || -z "$public_bn_hex" ]]; then
+  echo "❌ Public eth_blockNumber invalid. Raw response:"
+  echo "$public_bn_json"
+  exit 7
 fi
 
-__exit_code=0
-if [ "${__diverged}" -eq 1 ]; then
-  __exit_code=2
-  echo
-  echo "❌ Final status: diverged"
-elif [ "${__is_syncing}" -eq 1 ] || [ "${__lag}" -gt "${__block_lag}" ]; then
-  __exit_code=1
-  echo
-  echo "⏳ Final status: syncing"
+local_bn_dec="$(hex_to_dec "$local_bn_hex")"
+public_bn_dec="$(hex_to_dec "$public_bn_hex")"
+remaining="$((public_bn_dec - local_bn_dec))"
+
+echo "Local  head:    $local_bn_dec"
+echo "Public head:    $public_bn_dec"
+echo "Remaining:      $remaining blocks"
+
+echo "==> Sampling local head rate for ~${SAMPLE_SECS}s"
+sleep "$SAMPLE_SECS"
+
+local_bn_json_2="$(rpc_post "$LOCAL_RPC" '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}')"
+local_bn_hex_2="$(echo "$local_bn_json_2" | jq_eval '.result')"
+local_bn_dec_2="$(hex_to_dec "$local_bn_hex_2")"
+
+delta="$((local_bn_dec_2 - local_bn_dec))"
+echo "Advanced:       $delta blocks in ${SAMPLE_SECS}s"
+
+if (( delta <= 0 )); then
+  echo "ETA:            unknown (local head not advancing yet)"
 else
-  echo
-  echo "✅ Final status: in sync"
+  bps="$((delta / SAMPLE_SECS))"
+  if (( bps <= 0 )); then
+    echo "ETA:            unknown (rate < 1 block/sec over sample window)"
+  else
+    eta_secs="$((remaining / bps))"
+    eta_mins="$((eta_secs / 60))"
+    echo "Rate:           ~${bps} blocks/sec"
+    echo "ETA to head:    ~${eta_mins} minutes (very rough)"
+  fi
 fi
 
-exit "${__exit_code}"
+echo
+echo "==> Querying local and public latest blocks (height + hash)"
+
+local_json="$(rpc_post "$LOCAL_RPC" '{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["latest",false],"id":1}')"
+public_json="$(rpc_post "$PUBLIC_RPC" '{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["latest",false],"id":1}')"
+
+local_num="$(echo "$local_json"  | jq_eval '.result.number')"
+local_hash="$(echo "$local_json" | jq_eval '.result.hash')"
+
+public_num="$(echo "$public_json"  | jq_eval '.result.number')"
+public_hash="$(echo "$public_json" | jq_eval '.result.hash')"
+
+if [[ "$local_num" == "null" || "$local_hash" == "null" || -z "$local_num" || -z "$local_hash" ]]; then
+  echo "❌ Local RPC returned no block data (number/hash null). Raw response:"
+  echo "$local_json"
+  exit 3
+fi
+
+if [[ "$public_num" == "null" || "$public_hash" == "null" || -z "$public_num" || -z "$public_hash" ]]; then
+  echo "❌ Public RPC returned no block data (number/hash null). Raw response:"
+  echo "$public_json"
+  exit 4
+fi
+
+local_dec="$(hex_to_dec "$local_num")"
+public_dec="$(hex_to_dec "$public_num")"
+lag="$((public_dec - local_dec))"
+
+echo
+echo "Local   block: $local_dec  $local_hash"
+echo "Public  block: $public_dec $public_hash"
+echo "Lag:          $lag blocks (threshold: $BLOCK_LAG_THRESHOLD)"
+echo
+
+if [[ "$local_num" == "$public_num" && "$local_hash" == "$public_hash" ]]; then
+  echo "✅ Node is in sync (height and hash match)"
+  exit 0
+fi
+
+if (( lag > BLOCK_LAG_THRESHOLD )); then
+  echo "⚠️  Heights differ beyond threshold. Still syncing."
+  exit 1
+fi
+
+if [[ "$local_num" == "$public_num" && "$local_hash" != "$public_hash" ]]; then
+  echo "❌ Heights match but hashes differ. Possible reorg or divergence."
+  exit 2
+fi
+
+echo "⚠️  Heights differ but within threshold. Likely normal propagation lag."
+exit 0

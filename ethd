@@ -623,6 +623,15 @@ space() {
   __display_docker_volumes
 }
 
+check-sync() {
+  if [[ $# -eq 0 ]]; then
+    echo "Using RPC_PORT: 8545 publicRPC: https://1rpc.io/cro composeService: cronos"
+
+    bash scripts/check_sync.sh --public-rpc https://1rpc.io/cro --compose-service cronos --local-rpc http://127.0.0.1:8545 || true
+  else
+    bash scripts/check_sync.sh "$@" || true
+  fi
+}
 
 # Warn user if space is low
 __check_disk_space() {
@@ -1051,10 +1060,7 @@ if ! __docompose --help >/dev/null 2>&1; then
 fi
 
 case "$__command" in
-  check-sync)
-    ./scripts/check_sync.sh --compose-service cronos --public-rpc https://evm.cronos.org "$@"
-    ;;
-  help|update|up|start|down|stop|restart|version|logs|cmd|terminate|space)
+  help|update|up|start|down|stop|restart|version|logs|cmd|terminate|space|check-sync)
     $__command "$@"
     ;;
   *)
