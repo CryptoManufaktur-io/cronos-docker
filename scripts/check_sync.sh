@@ -17,9 +17,9 @@ Options:
   -h, --help               Show this help
 
 Examples:
-  ./check_sync.sh --public-rpc https://1rpc.io/cro
-  ./check_sync.sh --compose-service cronos --public-rpc https://1rpc.io/cro
-  CONTAINER=cronos-1 PUBLIC_RPC=https://1rpc.io/cro ./check_sync.sh
+  ./check_sync.sh --public-rpc https://cronos.drpc.org
+  ./check_sync.sh --compose-service cronos --public-rpc https://cronos.drpc.org
+  CONTAINER=cronos-1 PUBLIC_RPC=https://cronos.drpc.org ./check_sync.sh
 EOF
 }
 
